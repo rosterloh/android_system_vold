@@ -40,6 +40,8 @@
 
 #include <logwrap/logwrap.h>
 
+#include <private/android_filesystem_config.h>
+
 #include "Ext4.h"
 #include "VoldUtil.h"
 
@@ -66,6 +68,46 @@ int Ext4::doMount(const char *fsPath, const char *mountPoint, bool ro, bool remo
     }
 
     return rc;
+}
+
+int Ext4::doMount(const char *fsPath, const char *mountPoint, bool ro, bool remount,
+        bool executable, bool sdcard, const char *mountOpts) {
+    int rc;
+    unsigned long flags;
+    char data[1024];
+
+    data[0] = '\0';
+    if (mountOpts)
+        strlcat(data, mountOpts, sizeof(data));
+
+    flags = MS_NOATIME | MS_NODEV | MS_NOSUID | MS_DIRSYNC;
+
+    flags |= (executable ? 0 : MS_NOEXEC);
+    flags |= (ro ? MS_RDONLY : 0);
+    flags |= (remount ? MS_REMOUNT : 0);
+
+    if (sdcard) {
+        // Mount external volumes with default context
+        if (data[0])
+            strlcat(data, ",", sizeof(data));
+        strlcat(data, "defcontext=u:object_r:sdcard_external:s0", sizeof(data));
+    }
+
+    rc = mount(fsPath, mountPoint, "ext4", flags, data);
+
+    if (sdcard && rc == 0) {
+        // Write access workaround
+        chown(mountPoint, AID_MEDIA_RW, AID_MEDIA_RW);
+        chmod(mountPoint, 0755);
+    }
+
+    if (rc && errno == EROFS) {
+        SLOGE("%s appears to be a read only filesystem - retrying mount RO", fsPath);
+      flags |= MS_RDONLY;
+      rc = mount(fsPath, mountPoint, "ext4", flags, data);
+    }
+
+   return rc;
 }
 
 int Ext4::resize(const char *fspath, unsigned int numSectors) {

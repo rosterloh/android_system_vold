@@ -35,6 +35,8 @@
 
 #include <private/android_filesystem_config.h>
 
+#include <blkid/blkid.h>
+
 #define LOG_TAG "Vold"
 
 #include <cutils/fs.h>
@@ -46,6 +48,7 @@
 #include "VolumeManager.h"
 #include "ResponseCode.h"
 #include "Fat.h"
+#include "Ext4.h"
 #include "Process.h"
 #include "cryptfs.h"
 
@@ -139,6 +142,41 @@ dev_t Volume::getDiskDevice() {
 
 dev_t Volume::getShareDevice() {
     return getDiskDevice();
+}
+
+enum FS_TYPE {
+    FS_VFAT = 1,
+    FS_EXT4,
+    FS_NTFS,
+    FS_EXFAT,
+};
+
+int getFsType(const char * devicePath) {
+    char *fstag = NULL;
+    int type;
+
+    fstag = blkid_get_tag_value(NULL, "TYPE", devicePath);
+    if (fstag) {
+        SLOGD("Found %s filesystem on %s\n", fstag, devicePath);
+    } else {
+        SLOGE("None or unknown filesystem on %s\n", devicePath);
+        return FS_VFAT;
+    }
+
+    if (strcmp(fstag, "vfat") == 0)
+        type = FS_VFAT;
+    else if (strcmp(fstag, "ext4") == 0)
+        type = FS_EXT4;
+    else if (strcmp(fstag, "ntfs") == 0)
+        type = FS_NTFS;
+    else if (strcmp(fstag, "exfat") == 0)
+        type = FS_EXFAT;
+    else
+        type = -1;
+
+    free(fstag);
+
+    return type;
 }
 
 void Volume::handleVolumeShared() {
@@ -275,12 +313,18 @@ int Volume::formatVol(bool wipe) {
         SLOGI("Formatting volume %s (%s)", getLabel(), devicePath);
     }
 
-    if (Fat::format(devicePath, 0, wipe)) {
-        SLOGE("Failed to format (%s)", strerror(errno));
-        goto err;
+    int fstype;
+
+    fstype = getFsType((const char*)devicePath);
+    if (fstype == FS_VFAT) {
+        ret = Fat::format(devicePath, 0, wipe);
+    } else if (fstype == FS_EXT4) {
+        ret = Ext4::format(devicePath, 0, NULL);
     }
 
-    ret = 0;
+    if (ret < 0) {
+        SLOGE("Failed to format (%s)", strerror(errno));
+    }
 
 err:
     setState(Volume::State_Idle);
@@ -412,58 +456,6 @@ int Volume::mountVol() {
         }
     }
 
-#ifdef PATCH_FOR_SLSIAP
-    {
-        i = n - 1;
-        char devicePath[255];
-
-        sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes[i]),
-                MINOR(deviceNodes[i]));
-
-        SLOGI("%s being considered for volume %s\n", devicePath, getLabel());
-
-        errno = 0;
-        setState(Volume::State_Checking);
-
-        if (Fat::check(devicePath)) {
-            if (errno == ENODATA) {
-                SLOGW("%s does not contain a FAT filesystem\n", devicePath);
-                return -1;
-            }
-            errno = EIO;
-            /* Badness - abort the mount */
-            SLOGE("%s failed FS checks (%s)", devicePath, strerror(errno));
-            setState(Volume::State_Idle);
-            return -1;
-        }
-
-        errno = 0;
-        int gid;
-
-        if (Fat::doMount(devicePath, getMountpoint(), false, false, false,
-                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
-            SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
-            return -1;
-        }
-
-        extractMetadata(devicePath);
-
-        if (providesAsec && mountAsecExternal() != 0) {
-            SLOGE("Failed to mount secure area (%s)", strerror(errno));
-            umount(getMountpoint());
-            setState(Volume::State_Idle);
-            return -1;
-        }
-
-        char service[64];
-        snprintf(service, 64, "fuse_%s", getLabel());
-        property_set("ctl.start", service);
-
-        setState(Volume::State_Mounted);
-        mCurrentlyMountedKdev = deviceNodes[i];
-        return 0;
-    }
-#else
     for (i = 0; i < n; i++) {
         char devicePath[255];
 
@@ -475,25 +467,44 @@ int Volume::mountVol() {
         errno = 0;
         setState(Volume::State_Checking);
 
-        if (Fat::check(devicePath)) {
-            if (errno == ENODATA) {
-                SLOGW("%s does not contain a FAT filesystem\n", devicePath);
-                continue;
-            }
-            errno = EIO;
-            /* Badness - abort the mount */
-            SLOGE("%s failed FS checks (%s)", devicePath, strerror(errno));
-            setState(Volume::State_Idle);
-            return -1;
-        }
-
-        errno = 0;
         int gid;
 
-        if (Fat::doMount(devicePath, getMountpoint(), false, false, false,
-                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
-            SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
-            continue;
+        int fstype = getFsType((const char *)devicePath);
+
+        if (fstype == FS_VFAT) {
+
+            if (Fat::check(devicePath)) {
+                if (errno == ENODATA) {
+                    SLOGW("%s does not contain a FAT filesystem\n", devicePath);
+                    continue;
+                }
+                errno = EIO;
+                /* Badness - abort the mount */
+                SLOGE("%s failed FS checks (%s)", devicePath, strerror(errno));
+                setState(Volume::State_Idle);
+                return -1;
+            }
+
+            errno = 0;
+
+            if (Fat::doMount(devicePath, getMountpoint(), false, false, false,
+                      AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
+                SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+                continue;
+            }
+
+        } else if (fstype == FS_EXT4) {
+
+            if (Ext4::doMount(devicePath, getMountpoint(), false, false, false,
+                      true, NULL)) {
+                SLOGE("%s failed to mount via EXT4 (%s)\n", devicePath, strerror(errno));
+                continue;
+            }
+        } else {
+            // Unsupported filesystem
+            errno = ENODATA;
+            setState(Volume::State_Idle);
+            return -1;
         }
 
         extractMetadata(devicePath);
@@ -513,7 +524,6 @@ int Volume::mountVol() {
         mCurrentlyMountedKdev = deviceNodes[i];
         return 0;
     }
-#endif
 
     SLOGE("Volume %s found no suitable devices for mounting :(\n", getLabel());
     setState(Volume::State_Idle);
