@@ -160,7 +160,12 @@ static int process_config(VolumeManager *vm)
     int flags;
 
     property_get("ro.hardware", propbuf, "");
-    snprintf(fstab_filename, sizeof(fstab_filename), FSTAB_PREFIX"%s", propbuf);
+    i = snprintf(fstab_filename, sizeof(fstab_filename), FSTAB_PREFIX"%s", propbuf);
+    if (property_get("ro.bootdev", propbuf, "")) {
+        fstab_filename[i++] = '.';
+        strncat(fstab_filename + i, propbuf, 16);
+        SLOGI("Loading config %s\n", fstab_filename);
+    }
 
     fstab = fs_mgr_read_fstab(fstab_filename);
     if (!fstab) {
